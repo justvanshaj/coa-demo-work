@@ -5,6 +5,7 @@ import mammoth
 import io
 from datetime import datetime
 import calendar
+import random
 
 # --- Replace placeholders preserving font and color ---
 def advanced_replace_text_preserving_style(doc, replacements):
@@ -28,7 +29,6 @@ def advanced_replace_text_preserving_style(doc, replacements):
                         if new_runs:
                             new_run = new_runs[0]
                             new_run.text = accumulated
-                            # preserve font attributes where possible
                             try:
                                 new_run.font.name = font.name
                             except:
@@ -77,37 +77,23 @@ def docx_to_html(docx_path):
         result = mammoth.convert_to_html(docx_file)
         return result.value
 
-# --- Helper: distribute target among variables within min/max using weighted mids ---
+# --- Distribution helper (water-filling) reused from previous logic ---
 def distribute_within_bounds(target, names, mins, maxs, weights):
-    """
-    Water-filling style distribution:
-    - target: total sum to allocate
-    - names: list of names (for clarity)
-    - mins, maxs: dict(name->min), dict(name->max)
-    - weights: dict(name->weight) — initial preference (e.g., midpoints)
-    Returns dict(name->value) or raises ValueError if infeasible.
-    """
     eps = 1e-9
-    # feasibility
     min_sum = sum(mins[n] for n in names)
     max_sum = sum(maxs[n] for n in names)
     if target + eps < min_sum or target - eps > max_sum:
-        raise ValueError(f"Target {target} not achievable with given bounds (min_sum={min_sum}, max_sum={max_sum}).")
+        raise ValueError("Target not achievable with given bounds.")
 
-    # start with weighted allocation proportional to weights
     w_sum = sum(weights[n] for n in names)
     if w_sum <= 0:
-        # uniform fallback
         vals = {n: target / len(names) for n in names}
     else:
         vals = {n: target * (weights[n] / w_sum) for n in names}
 
-    # clamp iteratively and redistribute remainder until stable
     locked = {n: False for n in names}
-    for _ in range(50):  # finite iterations
+    for _ in range(100):
         changed = False
-        remainder = target - sum(vals[n] for n in names if not locked[n]) - sum(vals[n] for n in names if locked[n])
-        # clamp any values outside bounds
         for n in names:
             if not locked[n]:
                 if vals[n] < mins[n]:
@@ -119,35 +105,27 @@ def distribute_within_bounds(target, names, mins, maxs, weights):
                     locked[n] = True
                     changed = True
         if not changed:
-            # redistribute remainder among unlocked based on weights
             unlocked = [n for n in names if not locked[n]]
             if not unlocked:
                 break
-            rem = target - sum(vals[n] for n in names)
+            rem = target - sum(vals.values())
             if abs(rem) < 1e-8:
                 break
             w_un_sum = sum(weights[n] for n in unlocked)
             if w_un_sum <= 0:
-                # equal split
                 for n in unlocked:
                     vals[n] += rem / len(unlocked)
             else:
                 for n in unlocked:
                     vals[n] += rem * (weights[n] / w_un_sum)
-        # if nothing changed and remainder small -> ok
-        if not changed and abs(target - sum(vals.values())) < 1e-8:
-            break
 
-    # final clamp enforce and tiny rounding
     for n in names:
         vals[n] = max(min(vals[n], maxs[n]), mins[n])
         vals[n] = round(vals[n], 2)
 
-    # Final adjustment to match target exactly within small tolerance by nudging unlocked variables
-    total = sum(vals[n] for n in names)
+    total = round(sum(vals[n] for n in names), 2)
     diff = round(target - total, 2)
     if abs(diff) >= 0.01:
-        # try to adjust any variable that isn't at a bound
         adjustable = [n for n in names if mins[n] + 1e-9 < vals[n] < maxs[n] - 1e-9]
         for n in adjustable:
             allow_low = round(vals[n] - mins[n], 2)
@@ -158,114 +136,130 @@ def distribute_within_bounds(target, names, mins, maxs, weights):
                 diff = round(target - sum(vals.values()), 2)
                 if abs(diff) < 0.01:
                     break
-    # final feasibility check
+
     final_total = round(sum(vals[n] for n in names), 2)
     if abs(final_total - target) > 0.01:
-        raise ValueError(f"Could not distribute to meet target. final_total={final_total}, target={target}")
+        raise ValueError("Could not distribute to meet target.")
     return vals
 
-# --- Moisture-based automatic component calculation ---
-def calculate_components(moisture):
-    """
-    Auto-calc fat, air, ash, protein, gum using the specified ranges such that:
-    moisture + fat + air + ash + protein + gum = 100.0 (within 0.01)
-    Ranges:
-      fat: 0.45 - 0.55
-      air: 2.90 - 3.10
-      ash: 0.45 - 0.55
-      protein: 2.45 - 2.55
-      gum: 80.10 - 89.95
-    """
-    # validate moisture
-    if moisture < 0 or moisture > 100:
-        raise ValueError("Moisture must be between 0 and 100")
+# --- Ranges and mids ---
+RANGES = {
+    "fat": (0.45, 0.55),
+    "air": (2.90, 3.10),
+    "ash": (0.45, 0.55),
+    "protein": (2.45, 2.55),
+    "gum": (80.10, 89.95)
+}
+MIDS = {k: round((v[0] + v[1]) / 2.0, 4) for k, v in RANGES.items()}
 
+# --- Deterministic calculation (midpoints or constrained distribution) ---
+def calculate_components_deterministic(moisture):
     remaining = round(100.0 - float(moisture), 4)
-
-    # set ranges
-    ranges = {
-        "fat": (0.45, 0.55),
-        "air": (2.90, 3.10),
-        "ash": (0.45, 0.55),
-        "protein": (2.45, 2.55),
-        "gum": (80.10, 89.95)
-    }
-
-    # midpoints
-    mids = {k: round((v[0] + v[1]) / 2.0, 4) for k, v in ranges.items()}
-
-    # start with mids for non-gum
     others = ["fat", "air", "ash", "protein"]
-    others_mid_sum = sum(mids[o] for o in others)
-
-    # ideal gum to meet remaining
+    others_mid_sum = sum(MIDS[o] for o in others)
     gum_needed = round(remaining - others_mid_sum, 4)
-
-    gum_min, gum_max = ranges["gum"]
-    # if gum_needed inside gum range -> done (use mids for others and gum_needed)
+    gum_min, gum_max = RANGES["gum"]
     if gum_min - 1e-9 <= gum_needed <= gum_max + 1e-9:
-        fat = round(mids["fat"], 2)
-        air = round(mids["air"], 2)
-        ash = round(mids["ash"], 2)
-        protein = round(mids["protein"], 2)
+        fat = round(MIDS["fat"], 2)
+        air = round(MIDS["air"], 2)
+        ash = round(MIDS["ash"], 2)
+        protein = round(MIDS["protein"], 2)
         gum = round(gum_needed, 2)
-        # final rounding adjust small floating error
         total = round(moisture + fat + air + ash + protein + gum, 2)
         if abs(total - 100.0) > 0.01:
-            # tiny fix: adjust gum by the residual
             gum = round(gum + (100.0 - total), 2)
         return gum, protein, ash, air, fat
 
-    # otherwise clamp gum to closest bound and distribute remaining among others
-    # try with gum at mid then clamp:
-    # We'll try both extremes of gum (min, max) to find feasible distribution for others.
-    gum_try_list = []
-    # prefer gum that is closest to needed
-    if gum_needed < gum_min:
-        gum_try_list = [gum_min, gum_max]
-    else:
-        gum_try_list = [gum_max, gum_min]
-
+    # try clamp gum min or max and distribute
+    gum_try_list = [RANGES["gum"][0], RANGES["gum"][1]]
     for gum_try in gum_try_list:
-        available_for_others = round(remaining - gum_try, 4)
-        # prepare mins and maxs for others
-        mins = {o: ranges[o][0] for o in others}
-        maxs = {o: ranges[o][1] for o in others}
-        # weights from midpoints
-        weights = {o: mids[o] for o in others}
+        available = round(remaining - gum_try, 4)
+        mins = {o: RANGES[o][0] for o in others}
+        maxs = {o: RANGES[o][1] for o in others}
+        weights = {o: MIDS[o] for o in others}
         try:
-            allocated = distribute_within_bounds(available_for_others, others, mins, maxs, weights)
-            # success
+            allocated = distribute_within_bounds(available, others, mins, maxs, weights)
             fat = allocated["fat"]
             air = allocated["air"]
             ash = allocated["ash"]
             protein = allocated["protein"]
             gum = round(gum_try, 2)
-            # final total check and tiny fix
             total = round(moisture + fat + air + ash + protein + gum, 2)
             if abs(total - 100.0) > 0.01:
-                # apply tiny residual to gum if possible
                 residual = round(100.0 - total, 2)
                 new_gum = round(gum + residual, 2)
-                if ranges["gum"][0] <= new_gum <= ranges["gum"][1]:
+                if RANGES["gum"][0] <= new_gum <= RANGES["gum"][1]:
                     gum = new_gum
-                    total = round(moisture + fat + air + ash + protein + gum, 2)
-            if abs(total - 100.0) <= 0.01:
-                return gum, protein, ash, air, fat
-            # else try next gum_try
+            return gum, protein, ash, air, fat
+        except ValueError:
+            continue
+    raise ValueError("Unable to compute deterministic components for this moisture.")
+
+# --- Randomized calculation (tries sampling until feasible) ---
+def calculate_components_random(moisture, max_attempts=2000):
+    """
+    Try to sample random feasible components:
+    - Approach 1: sample fat/air/ash/protein uniformly in their ranges then compute gum.
+    - Approach 2: sample gum, then distribute remainder to others by random weights.
+    Repeat until success or max_attempts.
+    """
+    remaining = round(100.0 - float(moisture), 4)
+    others = ["fat", "air", "ash", "protein"]
+    gum_min, gum_max = RANGES["gum"]
+
+    for attempt in range(max_attempts):
+        # approach 1 (simple): sample others uniformly
+        sampled = {o: round(random.uniform(RANGES[o][0], RANGES[o][1]), 4) for o in others}
+        gum_needed = round(remaining - sum(sampled.values()), 4)
+        if gum_min - 1e-9 <= gum_needed <= gum_max + 1e-9:
+            # accept
+            fat = round(sampled["fat"], 2)
+            air = round(sampled["air"], 2)
+            ash = round(sampled["ash"], 2)
+            protein = round(sampled["protein"], 2)
+            gum = round(gum_needed, 2)
+            # final tiny fix
+            total = round(moisture + fat + air + ash + protein + gum, 2)
+            if abs(total - 100.0) > 0.01:
+                gum = round(gum + (100.0 - total), 2)
+            return gum, protein, ash, air, fat
+
+        # approach 2: sample gum first, then distribute remainder among others with random weights
+        gum_try = round(random.uniform(gum_min, gum_max), 4)
+        available_for_others = round(remaining - gum_try, 4)
+        mins = {o: RANGES[o][0] for o in others}
+        maxs = {o: RANGES[o][1] for o in others}
+        # random weights favoring random distribution but within bounds
+        rand_weights = {o: random.random() + MIDS[o] for o in others}
+        try:
+            allocated = distribute_within_bounds(available_for_others, others, mins, maxs, rand_weights)
+            fat = allocated["fat"]
+            air = allocated["air"]
+            ash = allocated["ash"]
+            protein = allocated["protein"]
+            gum = round(gum_try, 2)
+            total = round(moisture + fat + air + ash + protein + gum, 2)
+            # tiny fix
+            if abs(total - 100.0) > 0.01:
+                residual = round(100.0 - total, 2)
+                new_gum = round(gum + residual, 2)
+                if gum_min <= new_gum <= gum_max:
+                    gum = new_gum
+            return gum, protein, ash, air, fat
         except ValueError:
             continue
 
-    # if both attempts failed, it's infeasible
-    raise ValueError(
-        f"Unable to compute components that satisfy ranges for moisture={moisture}. "
-        f"Remaining={remaining}. Please check moisture value."
-    )
-
+    raise ValueError("Randomized sampling failed to find feasible components; try different moisture or increase attempts.")
 
 # --- Streamlit App Starts ---
 st.set_page_config(page_title="COA Generator", layout="wide")
-st.title("🧪 COA Document Generator (Auto Components)")
+st.title("🧪 COA Document Generator (Auto / Random Components)")
+
+# Initialize session state for components persistence
+if "components" not in st.session_state:
+    st.session_state["components"] = None
+if "random_mode" not in st.session_state:
+    st.session_state["random_mode"] = False
 
 with st.form("coa_form"):
     code = st.selectbox(
@@ -302,58 +296,127 @@ with st.form("coa_form"):
             st.warning("Enter Date in format: July 2025")
 
     batch_no = st.text_input("Batch Number")
-    moisture = st.number_input("Moisture (%)", min_value=0.0, max_value=99.0, step=0.01, value=10.0)
+    moisture = st.number_input("Moisture (%)", min_value=0.0, max_value=99.0, step=0.01, value=10.00, format="%.2f")
 
     st.markdown(
         "Component values (Fat, Air, Ash, Protein, Gum) will be **automatically calculated** "
         "to meet these constraints and sum to 100% with Moisture."
     )
 
+    # Randomize mode toggle and refresh button
+    random_mode = st.checkbox("Randomize components (enable randomizer)", value=False)
+    st.session_state["random_mode"] = random_mode
+
+    refresh_clicked = st.form_submit_button("Refresh components (randomizer)")
+    # Note: Using a separate button inside the form that when clicked will submit; we interpret it as refresh.
+    # The main submit will be below as 'Generate COA'.
+
     ph = st.text_input("pH Level (e.g., 6.7)")
     mesh_200 = st.text_input("200 Mesh (%)")
     viscosity_2h = st.text_input("Viscosity After 2 Hours (CPS)")
     viscosity_24h = st.text_input("Viscosity After 24 Hours (CPS)")
-    submitted = st.form_submit_button("Generate COA")
+    generate_clicked = st.form_submit_button("Generate COA")
 
-if submitted:
-    template_path = f"COA {code}.docx"
-    output_path = "generated_coa.docx"
-
-    # compute components automatically
+# Handling refresh (randomize) action: if user clicked the refresh button in the form
+if random_mode and refresh_clicked:
     try:
-        gum, protein, ash, air, fat = calculate_components(moisture)
+        gum, protein, ash, air, fat = calculate_components_random(moisture)
+        st.session_state["components"] = {
+            "Moisture": round(moisture, 2),
+            "Fat": float(f"{fat:.2f}"),
+            "Air": float(f"{air:.2f}"),
+            "Ash": float(f"{ash:.2f}"),
+            "Protein": float(f"{protein:.2f}"),
+            "Gum": float(f"{gum:.2f}")
+        }
+        st.success("Random components generated (refreshed).")
     except Exception as e:
-        st.error(f"Component calculation failed: {e}")
-        st.stop()
+        st.error(f"Random generation failed: {e}")
 
-    # show summary
+# If not random mode or no refresh yet, ensure deterministic components are available
+if st.session_state["components"] is None or (not random_mode and not refresh_clicked):
+    try:
+        gum, protein, ash, air, fat = calculate_components_deterministic(moisture)
+        st.session_state["components"] = {
+            "Moisture": round(moisture, 2),
+            "Fat": float(f"{fat:.2f}"),
+            "Air": float(f"{air:.2f}"),
+            "Ash": float(f"{ash:.2f}"),
+            "Protein": float(f"{protein:.2f}"),
+            "Gum": float(f"{gum:.2f}")
+        }
+    except Exception:
+        st.session_state["components"] = None
+
+# If random_mode but components exist from previous run, allow manual refresh via a separate button
+if random_mode and st.session_state["components"] is not None:
+    if st.button("Refresh now (randomize)"):
+        try:
+            gum, protein, ash, air, fat = calculate_components_random(moisture)
+            st.session_state["components"] = {
+                "Moisture": round(moisture, 2),
+                "Fat": float(f"{fat:.2f}"),
+                "Air": float(f"{air:.2f}"),
+                "Ash": float(f"{ash:.2f}"),
+                "Protein": float(f"{protein:.2f}"),
+                "Gum": float(f"{gum:.2f}")
+            }
+            st.success("Random components generated (refreshed).")
+        except Exception as e:
+            st.error(f"Random generation failed: {e}")
+
+# Show current composition table (always formatted with two decimals)
+if st.session_state["components"] is not None:
     try:
         import pandas as pd
+        comp = st.session_state["components"]
         summary_df = pd.DataFrame({
             "Component": ["Moisture", "Fat", "Air", "Ash", "Protein", "Gum"],
-            "Value (%)": [round(moisture, 2), round(fat,2), round(air,2), round(ash,2), round(protein,2), round(gum,2)]
+            "Value (%)": [
+                f"{comp['Moisture']:.2f}",
+                f"{comp['Fat']:.2f}",
+                f"{comp['Air']:.2f}",
+                f"{comp['Ash']:.2f}",
+                f"{comp['Protein']:.2f}",
+                f"{comp['Gum']:.2f}"
+            ]
         })
-        st.subheader("Composition summary (auto-calculated)")
+        st.subheader("Composition summary (current)")
         st.dataframe(summary_df, width=600)
-        total = round(moisture + fat + air + ash + protein + gum, 2)
-        st.info(f"Total = {total}%")
+        total = round(float(comp["Moisture"]) + float(comp["Fat"]) + float(comp["Air"]) + float(comp["Ash"]) + float(comp["Protein"]) + float(comp["Gum"]), 2)
+        st.info(f"Total = {total:.2f}%")
     except Exception:
         pass
+
+# When user clicks Generate COA, use the current components in session_state
+if generate_clicked:
+    if st.session_state["components"] is None:
+        st.error("Components not available. Try refreshing or check moisture range.")
+        st.stop()
+
+    comp = st.session_state["components"]
+    total = round(float(comp["Moisture"]) + float(comp["Fat"]) + float(comp["Air"]) + float(comp["Ash"]) + float(comp["Protein"]) + float(comp["Gum"]), 2)
+    if abs(total - 100.0) > 0.01:
+        st.error(f"Current components total {total:.2f}% does not equal 100.00%. Refresh or adjust moisture.")
+        st.stop()
+
+    template_path = f"COA {code}.docx"
+    output_path = "generated_coa.docx"
 
     data = {
         "DATE": date,
         "BATCH_NO": batch_no,
         "BEST_BEFORE": best_before,
-        "MOISTURE": f"{round(moisture,2)}%",
+        "MOISTURE": f"{comp['Moisture']:.2f}%",
         "PH": ph,
         "MESH_200": f"{mesh_200}%",
         "VISCOSITY_2H": viscosity_2h,
         "VISCOSITY_24H": viscosity_24h,
-        "GUM_CONTENT": f"{round(gum,2)}%",
-        "PROTEIN": f"{round(protein,2)}%",
-        "ASH_CONTENT": f"{round(ash,2)}%",
-        "AIR": f"{round(air,2)}%",
-        "FAT": f"{round(fat,2)}%"
+        "GUM_CONTENT": f"{comp['Gum']:.2f}%",
+        "PROTEIN": f"{comp['Protein']:.2f}%",
+        "ASH_CONTENT": f"{comp['Ash']:.2f}%",
+        "AIR": f"{comp['Air']:.2f}%",
+        "FAT": f"{comp['Fat']:.2f}%"
     }
 
     if not os.path.exists(template_path):
@@ -368,7 +431,6 @@ if submitted:
         except:
             st.warning("Preview failed. You can still download the file below.")
 
-        # Rename file based on batch & code
         safe_batch = (batch_no or "batch").replace("/", "_").replace("\\", "_").replace(" ", "_")
         final_filename = f"COA-{safe_batch}-{code}.docx"
 
