@@ -6,8 +6,11 @@ import io
 from datetime import datetime
 import calendar
 import random
+import pandas as pd
 
-# --- Replace placeholders preserving font and color ---
+# ---------------------------
+# Helper: placeholder replacement preserving style
+# ---------------------------
 def advanced_replace_text_preserving_style(doc, replacements):
     def replace_in_paragraph(paragraph):
         runs = paragraph.runs
@@ -64,20 +67,23 @@ def advanced_replace_text_preserving_style(doc, replacements):
                 for para in cell.paragraphs:
                     replace_in_paragraph(para)
 
-# --- Generate DOCX ---
+# ---------------------------
+# DOCX generate / preview
+# ---------------------------
 def generate_docx(data, template_path="template.docx", output_path="generated_coa.docx"):
     doc = Document(template_path)
     advanced_replace_text_preserving_style(doc, data)
     doc.save(output_path)
     return output_path
 
-# --- Convert DOCX to HTML preview ---
 def docx_to_html(docx_path):
     with open(docx_path, "rb") as docx_file:
         result = mammoth.convert_to_html(docx_file)
         return result.value
 
-# --- Distribution helper (water-filling) reused from previous logic ---
+# ---------------------------
+# Distribution helper (water-filling)
+# ---------------------------
 def distribute_within_bounds(target, names, mins, maxs, weights):
     eps = 1e-9
     min_sum = sum(mins[n] for n in names)
@@ -142,7 +148,9 @@ def distribute_within_bounds(target, names, mins, maxs, weights):
         raise ValueError("Could not distribute to meet target.")
     return vals
 
-# --- Ranges and mids ---
+# ---------------------------
+# Ranges and mids
+# ---------------------------
 RANGES = {
     "fat": (0.45, 0.55),
     "air": (2.90, 3.10),
@@ -152,7 +160,9 @@ RANGES = {
 }
 MIDS = {k: round((v[0] + v[1]) / 2.0, 4) for k, v in RANGES.items()}
 
-# --- Deterministic calculation (midpoints or constrained distribution) ---
+# ---------------------------
+# Deterministic & Random calculation
+# ---------------------------
 def calculate_components_deterministic(moisture):
     remaining = round(100.0 - float(moisture), 4)
     others = ["fat", "air", "ash", "protein"]
@@ -170,7 +180,6 @@ def calculate_components_deterministic(moisture):
             gum = round(gum + (100.0 - total), 2)
         return gum, protein, ash, air, fat
 
-    # try clamp gum min or max and distribute
     gum_try_list = [RANGES["gum"][0], RANGES["gum"][1]]
     for gum_try in gum_try_list:
         available = round(remaining - gum_try, 4)
@@ -195,41 +204,29 @@ def calculate_components_deterministic(moisture):
             continue
     raise ValueError("Unable to compute deterministic components for this moisture.")
 
-# --- Randomized calculation (tries sampling until feasible) ---
 def calculate_components_random(moisture, max_attempts=2000):
-    """
-    Try to sample random feasible components:
-    - Approach 1: sample fat/air/ash/protein uniformly in their ranges then compute gum.
-    - Approach 2: sample gum, then distribute remainder to others by random weights.
-    Repeat until success or max_attempts.
-    """
     remaining = round(100.0 - float(moisture), 4)
     others = ["fat", "air", "ash", "protein"]
     gum_min, gum_max = RANGES["gum"]
 
     for attempt in range(max_attempts):
-        # approach 1 (simple): sample others uniformly
         sampled = {o: round(random.uniform(RANGES[o][0], RANGES[o][1]), 4) for o in others}
         gum_needed = round(remaining - sum(sampled.values()), 4)
         if gum_min - 1e-9 <= gum_needed <= gum_max + 1e-9:
-            # accept
             fat = round(sampled["fat"], 2)
             air = round(sampled["air"], 2)
             ash = round(sampled["ash"], 2)
             protein = round(sampled["protein"], 2)
             gum = round(gum_needed, 2)
-            # final tiny fix
             total = round(moisture + fat + air + ash + protein + gum, 2)
             if abs(total - 100.0) > 0.01:
                 gum = round(gum + (100.0 - total), 2)
             return gum, protein, ash, air, fat
 
-        # approach 2: sample gum first, then distribute remainder among others with random weights
         gum_try = round(random.uniform(gum_min, gum_max), 4)
         available_for_others = round(remaining - gum_try, 4)
         mins = {o: RANGES[o][0] for o in others}
         maxs = {o: RANGES[o][1] for o in others}
-        # random weights favoring random distribution but within bounds
         rand_weights = {o: random.random() + MIDS[o] for o in others}
         try:
             allocated = distribute_within_bounds(available_for_others, others, mins, maxs, rand_weights)
@@ -239,7 +236,6 @@ def calculate_components_random(moisture, max_attempts=2000):
             protein = allocated["protein"]
             gum = round(gum_try, 2)
             total = round(moisture + fat + air + ash + protein + gum, 2)
-            # tiny fix
             if abs(total - 100.0) > 0.01:
                 residual = round(100.0 - total, 2)
                 new_gum = round(gum + residual, 2)
@@ -251,17 +247,21 @@ def calculate_components_random(moisture, max_attempts=2000):
 
     raise ValueError("Randomized sampling failed to find feasible components; try different moisture or increase attempts.")
 
-# --- Streamlit App Starts ---
+# ---------------------------
+# Streamlit UI
+# ---------------------------
 st.set_page_config(page_title="COA Generator", layout="wide")
-st.title("🧪 COA Document Generator (Auto / Random Components)")
+st.title("🧪 COA Document Generator (Auto Randomized Components)")
 
-# Initialize session state for components persistence
+# session state keys
 if "components" not in st.session_state:
     st.session_state["components"] = None
-if "random_mode" not in st.session_state:
-    st.session_state["random_mode"] = False
+if "components_moisture" not in st.session_state:
+    st.session_state["components_moisture"] = None
 
-with st.form("coa_form"):
+# Input area (use normal widgets so buttons outside can control behavior)
+col_left, col_right = st.columns([2, 1])
+with col_left:
     code = st.selectbox(
         "Select Product Code Range",
         [f"{i}-{i+500}" for i in range(500, 10001, 500)]
@@ -270,7 +270,7 @@ with st.form("coa_form"):
 
     date = st.text_input("Date (e.g., July 2025)")
 
-    # Auto-calculate Best Before (robust parsing)
+    # Auto Best Before
     best_before = ""
     if date:
         parsed = None
@@ -297,28 +297,46 @@ with st.form("coa_form"):
 
     batch_no = st.text_input("Batch Number")
     moisture = st.number_input("Moisture (%)", min_value=0.0, max_value=99.0, step=0.01, value=10.00, format="%.2f")
-
     st.markdown(
-        "Component values (Fat, Air, Ash, Protein, Gum) will be **automatically calculated** "
-        "to meet these constraints and sum to 100% with Moisture."
+        "Component values (Fat, Air, Ash, Protein, Gum) are **automatically randomized** (within specified ranges) "
+        "and will sum with Moisture to 100%."
     )
 
-    # Randomize mode toggle and refresh button
-    random_mode = st.checkbox("Randomize components (enable randomizer)", value=False)
-    st.session_state["random_mode"] = random_mode
-
-    refresh_clicked = st.form_submit_button("Refresh components (randomizer)")
-    # Note: Using a separate button inside the form that when clicked will submit; we interpret it as refresh.
-    # The main submit will be below as 'Generate COA'.
-
+with col_right:
     ph = st.text_input("pH Level (e.g., 6.7)")
     mesh_200 = st.text_input("200 Mesh (%)")
     viscosity_2h = st.text_input("Viscosity After 2 Hours (CPS)")
     viscosity_24h = st.text_input("Viscosity After 24 Hours (CPS)")
-    generate_clicked = st.form_submit_button("Generate COA")
 
-# Handling refresh (randomize) action: if user clicked the refresh button in the form
-if random_mode and refresh_clicked:
+# regenerate automatically when moisture changes (to avoid stale components)
+def ensure_components_for_current_moisture():
+    if st.session_state["components"] is None or st.session_state["components_moisture"] != round(moisture, 2):
+        try:
+            gum, protein, ash, air, fat = calculate_components_random(moisture)
+        except Exception:
+            # fallback deterministic if random fails
+            gum, protein, ash, air, fat = calculate_components_deterministic(moisture)
+        st.session_state["components"] = {
+            "Moisture": round(moisture, 2),
+            "Fat": float(f"{fat:.2f}"),
+            "Air": float(f"{air:.2f}"),
+            "Ash": float(f"{ash:.2f}"),
+            "Protein": float(f"{protein:.2f}"),
+            "Gum": float(f"{gum:.2f}")
+        }
+        st.session_state["components_moisture"] = round(moisture, 2)
+
+ensure_components_for_current_moisture()
+
+# Buttons row: Refresh components and Generate COA side-by-side
+btn_col1, btn_col2 = st.columns([1, 1])
+with btn_col1:
+    refresh = st.button("🔄 Refresh components")
+with btn_col2:
+    generate = st.button("Generate COA")
+
+# If refresh clicked, randomize and update session_state
+if refresh:
     try:
         gum, protein, ash, air, fat = calculate_components_random(moisture)
         st.session_state["components"] = {
@@ -329,118 +347,78 @@ if random_mode and refresh_clicked:
             "Protein": float(f"{protein:.2f}"),
             "Gum": float(f"{gum:.2f}")
         }
-        st.success("Random components generated (refreshed).")
+        st.session_state["components_moisture"] = round(moisture, 2)
+        st.success("Components refreshed (randomized).")
     except Exception as e:
         st.error(f"Random generation failed: {e}")
 
-# If not random mode or no refresh yet, ensure deterministic components are available
-if st.session_state["components"] is None or (not random_mode and not refresh_clicked):
-    try:
-        gum, protein, ash, air, fat = calculate_components_deterministic(moisture)
-        st.session_state["components"] = {
-            "Moisture": round(moisture, 2),
-            "Fat": float(f"{fat:.2f}"),
-            "Air": float(f"{air:.2f}"),
-            "Ash": float(f"{ash:.2f}"),
-            "Protein": float(f"{protein:.2f}"),
-            "Gum": float(f"{gum:.2f}")
-        }
-    except Exception:
-        st.session_state["components"] = None
-
-# If random_mode but components exist from previous run, allow manual refresh via a separate button
-if random_mode and st.session_state["components"] is not None:
-    if st.button("Refresh now (randomize)"):
-        try:
-            gum, protein, ash, air, fat = calculate_components_random(moisture)
-            st.session_state["components"] = {
-                "Moisture": round(moisture, 2),
-                "Fat": float(f"{fat:.2f}"),
-                "Air": float(f"{air:.2f}"),
-                "Ash": float(f"{ash:.2f}"),
-                "Protein": float(f"{protein:.2f}"),
-                "Gum": float(f"{gum:.2f}")
-            }
-            st.success("Random components generated (refreshed).")
-        except Exception as e:
-            st.error(f"Random generation failed: {e}")
-
-# Show current composition table (always formatted with two decimals)
-if st.session_state["components"] is not None:
-    try:
-        import pandas as pd
-        comp = st.session_state["components"]
-        summary_df = pd.DataFrame({
-            "Component": ["Moisture", "Fat", "Air", "Ash", "Protein", "Gum"],
-            "Value (%)": [
-                f"{comp['Moisture']:.2f}",
-                f"{comp['Fat']:.2f}",
-                f"{comp['Air']:.2f}",
-                f"{comp['Ash']:.2f}",
-                f"{comp['Protein']:.2f}",
-                f"{comp['Gum']:.2f}"
-            ]
-        })
-        st.subheader("Composition summary (current)")
-        st.dataframe(summary_df, width=600)
-        total = round(float(comp["Moisture"]) + float(comp["Fat"]) + float(comp["Air"]) + float(comp["Ash"]) + float(comp["Protein"]) + float(comp["Gum"]), 2)
-        st.info(f"Total = {total:.2f}%")
-    except Exception:
-        pass
-
-# When user clicks Generate COA, use the current components in session_state
-if generate_clicked:
-    if st.session_state["components"] is None:
-        st.error("Components not available. Try refreshing or check moisture range.")
-        st.stop()
-
+# Show composition summary as a single-row table (columns horizontally)
+if st.session_state["components"]:
     comp = st.session_state["components"]
+    summary_df = pd.DataFrame([{
+        "Moisture (%)": f"{comp['Moisture']:.2f}",
+        "Fat (%)": f"{comp['Fat']:.2f}",
+        "Air (%)": f"{comp['Air']:.2f}",
+        "Ash (%)": f"{comp['Ash']:.2f}",
+        "Protein (%)": f"{comp['Protein']:.2f}",
+        "Gum (%)": f"{comp['Gum']:.2f}"
+    }])
+    st.subheader("Composition summary (current)")
+    st.dataframe(summary_df, width=900)
     total = round(float(comp["Moisture"]) + float(comp["Fat"]) + float(comp["Air"]) + float(comp["Ash"]) + float(comp["Protein"]) + float(comp["Gum"]), 2)
-    if abs(total - 100.0) > 0.01:
-        st.error(f"Current components total {total:.2f}% does not equal 100.00%. Refresh or adjust moisture.")
-        st.stop()
+    st.info(f"Total = {total:.2f}%")
 
-    template_path = f"COA {code}.docx"
-    output_path = "generated_coa.docx"
-
-    data = {
-        "DATE": date,
-        "BATCH_NO": batch_no,
-        "BEST_BEFORE": best_before,
-        "MOISTURE": f"{comp['Moisture']:.2f}%",
-        "PH": ph,
-        "MESH_200": f"{mesh_200}%",
-        "VISCOSITY_2H": viscosity_2h,
-        "VISCOSITY_24H": viscosity_24h,
-        "GUM_CONTENT": f"{comp['Gum']:.2f}%",
-        "PROTEIN": f"{comp['Protein']:.2f}%",
-        "ASH_CONTENT": f"{comp['Ash']:.2f}%",
-        "AIR": f"{comp['Air']:.2f}%",
-        "FAT": f"{comp['Fat']:.2f}%"
-    }
-
-    if not os.path.exists(template_path):
-        st.error(f"Template file 'COA {code}.docx' not found.")
+# Handle Generate COA click: validate and generate
+if generate:
+    if st.session_state["components"] is None:
+        st.error("Components not available. Try refreshing.")
     else:
-        generate_docx(data, template_path=template_path, output_path=output_path)
+        comp = st.session_state["components"]
+        total = round(float(comp["Moisture"]) + float(comp["Fat"]) + float(comp["Air"]) + float(comp["Ash"]) + float(comp["Protein"]) + float(comp["Gum"]), 2)
+        if abs(total - 100.0) > 0.01:
+            st.error(f"Current components total {total:.2f}% does not equal 100.00%. Refresh components.")
+        else:
+            data = {
+                "DATE": date,
+                "BATCH_NO": batch_no,
+                "BEST_BEFORE": best_before,
+                "MOISTURE": f"{comp['Moisture']:.2f}%",
+                "PH": ph,
+                "MESH_200": f"{mesh_200}%",
+                "VISCOSITY_2H": viscosity_2h,
+                "VISCOSITY_24H": viscosity_24h,
+                "GUM_CONTENT": f"{comp['Gum']:.2f}%",
+                "PROTEIN": f"{comp['Protein']:.2f}%",
+                "ASH_CONTENT": f"{comp['Ash']:.2f}%",
+                "AIR": f"{comp['Air']:.2f}%",
+                "FAT": f"{comp['Fat']:.2f}%"
+            }
 
-        try:
-            html = docx_to_html(output_path)
-            st.subheader("📄 Preview")
-            st.components.v1.html(f"<div style='padding:15px'>{html}</div>", height=700, scrolling=True)
-        except:
-            st.warning("Preview failed. You can still download the file below.")
+            template_path = f"COA {code}.docx"
+            output_path = "generated_coa.docx"
 
-        safe_batch = (batch_no or "batch").replace("/", "_").replace("\\", "_").replace(" ", "_")
-        final_filename = f"COA-{safe_batch}-{code}.docx"
+            if not os.path.exists(template_path):
+                st.error(f"Template file 'COA {code}.docx' not found.")
+            else:
+                generate_docx(data, template_path=template_path, output_path=output_path)
 
-        with open(output_path, "rb") as f:
-            doc_bytes = f.read()
-        buffer = io.BytesIO(doc_bytes)
+                try:
+                    html = docx_to_html(output_path)
+                    st.subheader("📄 Preview")
+                    st.components.v1.html(f"<div style='padding:15px'>{html}</div>", height=700, scrolling=True)
+                except Exception:
+                    st.warning("Preview failed. You can still download the file below.")
 
-        st.download_button(
-            label="📥 Download COA (DOCX)",
-            data=buffer,
-            file_name=final_filename,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
+                safe_batch = (batch_no or "batch").replace("/", "_").replace("\\", "_").replace(" ", "_")
+                final_filename = f"COA-{safe_batch}-{code}.docx"
+
+                with open(output_path, "rb") as f:
+                    doc_bytes = f.read()
+                buffer = io.BytesIO(doc_bytes)
+
+                st.download_button(
+                    label="📥 Download COA (DOCX)",
+                    data=buffer,
+                    file_name=final_filename,
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
